@@ -1,6 +1,6 @@
-faiss_cpu==1.10.0
-FlagEmbedding==1.3.4
-matplotlib==3.10.0
-numpy==2.2.3
-scikit_learn==1.6.1
-tqdm==4.67.1
+faiss_cpu
+FlagEmbedding
+matplotlib
+numpy
+scikit_learn
+tqdm
