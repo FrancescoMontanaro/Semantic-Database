@@ -12,7 +12,7 @@ destination_path = "./example_database"
 semantic_database = SemanticDatabase(base_directory)
 
 # Creating the database
-#semantic_database.create_or_update(destination_path)
+semantic_database.create_or_update(destination_path)
 
 # Loading the database
 semantic_database.load(destination_path)

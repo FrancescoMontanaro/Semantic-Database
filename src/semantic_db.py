@@ -7,7 +7,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from typing import Optional, List, Dict
-from transformers import DPRQuestionEncoder, DPRContextEncoder, DPRQuestionEncoderTokenizer, DPRContextEncoderTokenizer
+from FlagEmbedding import BGEM3FlagModel
 
 from . import utils
 from .cryptography import Cryptography
@@ -21,9 +21,7 @@ class SemanticDatabase:
     
     DATABASE_FILE = "database.index" # Name of the vector database file
     DOCUMENTS_FILE = "documents.json" # Name of the documents mapping file
-    
-    QUERY_ENCODER_ID = "facebook/dpr-question_encoder-single-nq-base" # ID of the query encoder model
-    DOCUMENTS_ECODER_ID = "facebook/dpr-ctx_encoder-single-nq-base" # ID of the documents encoder model
+    ENCODER_MODEL_ID = "BAAI/bge-m3" # ID of the encoder model
     
     
     #########################
@@ -42,11 +40,8 @@ class SemanticDatabase:
         # Set the base directory
         self.base_directory = base_directory or os.getcwd()
         
-        # Encoding models and tokenizers
-        self.query_encoder: Optional[DPRQuestionEncoder] = None
-        self.query_tokenizer: Optional[DPRQuestionEncoderTokenizer] = None
-        self.documents_encoder: Optional[DPRContextEncoder] = None
-        self.documents_tokenizer: Optional[DPRContextEncoderTokenizer] = None
+        # Encoding model
+        self.encoder: Optional[BGEM3FlagModel] = None
         
         # Vector database and documents mapping
         self.vector_database: Optional[faiss.IndexIDMap] = None
@@ -81,7 +76,7 @@ class SemanticDatabase:
             raise Exception("The database is not initialized! Please load or create a database first.")
         
         # Embedding the query
-        query_embedding = self._encode_texts([query_string], self.query_encoder, self.query_tokenizer) # type: ignore
+        query_embedding = self._encode_texts([query_string])
         
         # Search for the most similar documents order by similarity
         # This returns a tuple with the distances and the indices of the documents
@@ -189,7 +184,7 @@ class SemanticDatabase:
             logging.info("Creating a new semantic database...")
             self._load_models()
             self.documents_mapping = []
-            self.vector_database = faiss.IndexIDMap(faiss.IndexFlatL2(self.documents_encoder.config.hidden_size)) # type: ignore
+            self.vector_database = faiss.IndexIDMap(faiss.IndexFlatL2(8192)) # type: ignore
                
         # List the documents in the specified path
         logging.info("Listing the documents in the specified path...")
@@ -268,10 +263,7 @@ class SemanticDatabase:
         return (
             isinstance(self.vector_database, faiss.IndexIDMap) and
             isinstance(self.documents_mapping, list) and
-            isinstance(self.documents_encoder, DPRContextEncoder) and
-            isinstance(self.documents_tokenizer, DPRContextEncoderTokenizer) and
-            isinstance(self.query_encoder, DPRQuestionEncoder) and
-            isinstance(self.query_tokenizer, DPRQuestionEncoderTokenizer)
+            isinstance(self.encoder, BGEM3FlagModel)
         )
     
     
@@ -281,19 +273,7 @@ class SemanticDatabase:
         """
         
         # Initialize the query and documents encoders
-        self.query_encoder = DPRQuestionEncoder.from_pretrained(self.QUERY_ENCODER_ID)
-        self.documents_encoder = DPRContextEncoder.from_pretrained(self.DOCUMENTS_ECODER_ID)
-        
-        # Initialize the query and documents tokenizers
-        self.query_tokenizer = DPRQuestionEncoderTokenizer.from_pretrained(self.QUERY_ENCODER_ID)
-        self.documents_tokenizer = DPRContextEncoderTokenizer.from_pretrained(self.DOCUMENTS_ECODER_ID)
-        
-        # Get the device
-        self.device = utils.get_device()
-        
-        # Move the models to the device
-        self.query_encoder.to(self.device) # type: ignore
-        self.documents_encoder.to(self.device) # type: ignore
+        self.encoder = BGEM3FlagModel(self.ENCODER_MODEL_ID, use_fp16=True)
 
         
     def _save_db(self, destination_path: str) -> None:
@@ -325,33 +305,24 @@ class SemanticDatabase:
             json.dump(self.documents_mapping, f, indent=4)
     
     
-    def _encode_texts(self, texts: list[str], encoder: DPRQuestionEncoder, tokenizer: DPRQuestionEncoderTokenizer, max_context_length: int = 512) -> np.ndarray:
+    def _encode_texts(self, texts: list[str]) -> np.ndarray:
         """
         Encode a list of texts using the specified encoder and tokenizer.
         
         Parameters:
         -----------
         - texts (list[str]): the list of texts to encode
-        - encoder (DPRQuestionEncoder): the encoder model to use
-        - tokenizer (DPRQuestionEncoderTokenizer): the tokenizer to use
-        - max_context_length (int): the maximum length of the context
         
         Returns:
         --------
         - np.ndarray: the embeddings of the texts
         """
         
-        # Tokenize the text and convert to PyTorch tensors
-        inputs = tokenizer(
-            texts, 
-            return_tensors = "pt", 
-            padding = True, 
-            truncation = True,
-            max_length = max_context_length 
-        ).to(self.device)
-        
         # Get the embeddings using the encoder model and convert them to a numpy array
-        embeddings = encoder(**inputs).pooler_output.detach().cpu().numpy()
+        embeddings = self.encoder.encode(texts)['dense_vecs'] # type: ignore
+        
+        # Convert the embeddings to a numpy array
+        embeddings = np.array(embeddings)
         
         # Return the embeddings
         return embeddings
@@ -388,7 +359,7 @@ class SemanticDatabase:
                     document_hash = Cryptography.compute_hash(document_content)
                     
                     # Reading and encoding the content of the docuemnt into the embedding space
-                    document_embedding = self._encode_texts([document_content], self.documents_encoder, self.documents_tokenizer) # type: ignore
+                    document_embedding = self._encode_texts([document_content])
                     
             except Exception as e:
                 # Log the exception and continue to the next document
