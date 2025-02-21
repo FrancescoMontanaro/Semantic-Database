@@ -4,6 +4,8 @@ import faiss
 import logging
 import numpy as np
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 from typing import Optional, List, Dict
 from transformers import DPRQuestionEncoder, DPRContextEncoder, DPRQuestionEncoderTokenizer, DPRContextEncoderTokenizer
 
@@ -47,7 +49,7 @@ class SemanticDatabase:
         self.documents_tokenizer: Optional[DPRContextEncoderTokenizer] = None
         
         # Vector database and documents mapping
-        self.vector_database: Optional[faiss.IndexFlatL2] = None
+        self.vector_database: Optional[faiss.IndexIDMap] = None
         self.documents_mapping: List[Dict] = []
         
        
@@ -204,6 +206,49 @@ class SemanticDatabase:
             
         # Log status
         logging.info("Semantic database created successfully!")
+    
+    
+    def plot_space(self) -> None:
+        """
+        Reproject the embedding space in 2D using TSNE and plot the documents.
+        
+        Raises:
+        -------
+        - Exception: if the database is not initialized
+        """
+        
+        # Check if the database is initialized
+        if not self._is_db_initialized():
+            # Raise an exception if the database is not initialized
+            raise Exception("The database is not initialized! Please load or create a database first.")
+        
+        # Get the total number of documents to plot (Maximum 100)
+        n_to_plot = min(100, self.vector_database.ntotal) # type: ignore
+        
+        # Compute the TSNE embeddings
+        perplexity = min(30, n_to_plot - 1) # Set the perplexity to the minimum between 30 and the number of documents to plot
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+        
+        # Get the embeddings of the documents
+        embeddings = np.array([self.vector_database.index.reconstruct(i) for i in range(n_to_plot)]) # type: ignore
+        
+        # Reduce the dimensionality of the embeddings to 2D
+        embeddings_2d = tsne.fit_transform(embeddings) # type: ignore
+        
+        # Plot the 2D embeddings
+        plt.figure(figsize=(8, 6))
+        plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], c="b", edgecolor="k")
+        
+        # Add labels to the points
+        for i, txt in enumerate(self.documents_mapping[:n_to_plot]):
+            plt.annotate(txt["path"], (embeddings_2d[i, 0], embeddings_2d[i, 1]))
+            
+        # Show the plot
+        plt.title("2D embeddings of the documents")
+        plt.xlabel("Dimension 1")
+        plt.ylabel("Dimension 2")
+        plt.grid(True)
+        plt.show()
     
     
     #########################
