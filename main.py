@@ -1,32 +1,24 @@
+import logging
 from src import SemanticDatabase
 
+# Setup logging to console
+logging.basicConfig(level=logging.INFO)
+
+# Define the base directory and the local destination
+base_directory = "/Users/francescomontanaro/Desktop/5 - Full notes"
+destination_path = "./example_database"
+
 # Instantiate the semantic database
-semantic_database = SemanticDatabase()
-
-# Define the paths of the database and the local destination
-documents_path = "YOUR_PATH_TO_THE_DOCUMENTS"
-destination_path = "YOUR_PATH_TO_THE_DESTINATION"
-
-# Define the paths of the query and documents encoders
-query_encoder_id = "facebook/dpr-question_encoder-single-nq-base"
-documents_encoder_id = "facebook/dpr-ctx_encoder-single-nq-base"
+semantic_database = SemanticDatabase(base_directory)
 
 # Creating the database
-semantic_database.create(
-    documents_path = documents_path,
-    query_encoder_id = query_encoder_id,
-    documents_encoder_id = documents_encoder_id,
-    destination_path = destination_path
-)
+semantic_database.create_or_update(destination_path)
 
 # Loading the database
 semantic_database.load(destination_path)
 
-# Update the database with new documents
-semantic_database.update(
-    documents_path = "/Users/francescomontanaro/Desktop/Test",
-    destination_path = destination_path
-)
+# Updating the database
+semantic_database.create_or_update(destination_path)
 
 # Executing a query
 results = semantic_database.query(

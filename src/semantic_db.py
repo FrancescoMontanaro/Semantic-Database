@@ -4,37 +4,56 @@ import faiss
 import logging
 import numpy as np
 from tqdm import tqdm
-from typing import Optional
+from typing import Optional, List, Dict
 from transformers import DPRQuestionEncoder, DPRContextEncoder, DPRQuestionEncoderTokenizer, DPRContextEncoderTokenizer
 
 from . import utils
+from .cryptography import Cryptography
 
 
 class SemanticDatabase:
     
+    #########################
     ### Static attributes ###
+    #########################
     
-    config_file = "config.json" # Name of the database configuration file
-    database_file = "database.index" # Name of the vector database file
-    documents_file = "documents.json" # Name of the documents mapping file 
+    DATABASE_FILE = "database.index" # Name of the vector database file
+    DOCUMENTS_FILE = "documents.json" # Name of the documents mapping file
     
-    ### Magic methods ###
+    QUERY_ENCODER_ID = "facebook/dpr-question_encoder-single-nq-base" # ID of the query encoder model
+    DOCUMENTS_ECODER_ID = "facebook/dpr-ctx_encoder-single-nq-base" # ID of the documents encoder model
     
-    def __init__(self) -> None:
+    
+    #########################
+    ##### Magic methods #####
+    #########################
+    
+    def __init__(self, base_directory: Optional[str] = None):
         """
         Initialize the SemanticDatabase class.
+        
+        Parameters:
+        -----------
+        - base_directory (Optional[str]): the base directory to use. Default is the current working directory.
         """
         
-        # Create the query and documents encoders and tokenizers
-        self.query_encoder, self.query_tokenizer = None, None
-        self.documents_encoder, self.documents_tokenizer = None, None
+        # Set the base directory
+        self.base_directory = base_directory or os.getcwd()
         
-        # Create a variable to store the vector database and documents mapping
-        self.vector_database = None
-        self.documents_mapping = []
+        # Encoding models and tokenizers
+        self.query_encoder: Optional[DPRQuestionEncoder] = None
+        self.query_tokenizer: Optional[DPRQuestionEncoderTokenizer] = None
+        self.documents_encoder: Optional[DPRContextEncoder] = None
+        self.documents_tokenizer: Optional[DPRContextEncoderTokenizer] = None
         
+        # Vector database and documents mapping
+        self.vector_database: Optional[faiss.IndexFlatL2] = None
+        self.documents_mapping: List[Dict] = []
         
-    ### Public methods ###
+       
+    #########################
+    ##### Public methods ####
+    #########################
     
     def query(self, query_string: str, num_results: int = 1) -> list[dict]:
         """
@@ -52,18 +71,12 @@ class SemanticDatabase:
         Raises:
         -------
         - Exception: if the database is not initialized
-        - Exception: if the database is not consistent
         """
         
         # Check if the database is initialized
-        if not self._is_database_initialized():
+        if not self._is_db_initialized():
             # Raise an exception if the database is not initialized
             raise Exception("The database is not initialized! Please load or create a database first.")
-        
-        # Check if the database is consistent
-        if not self._is_database_consistent():
-            # Raise an exception if the database is not consistent
-            raise Exception("The database is not consistent! The mapping between documents and embeddings is not correct.")
         
         # Embedding the query
         query_embedding = self._encode_texts([query_string], self.query_encoder, self.query_tokenizer) # type: ignore
@@ -77,80 +90,30 @@ class SemanticDatabase:
         
         # Iterate over the distances and indices
         for dist, idx in zip(distances[0], indices[0]):
-            # Append the results to the list
+            # Extract the document from the documents mapping
+            target_document = next((doc for doc in self.documents_mapping if doc.get("index") == idx), None)
+            
+            # Check if the document exists
+            if target_document is None:
+                # Log the warning and continue
+                logging.error(f"Document with index {idx} not found! Skipping...")
+                continue
+            
+            # Check if the target document exists in the base directory
+            if not os.path.exists(os.path.join(self.base_directory, target_document["path"])):
+                # Log a warning
+                logging.warning(f"Document {target_document['path']} does not exist in the base directory. Maybe it was moved or the base directory has changed.")
+            
+            # Append the document to the results list
             results.append({
                 "index": int(idx),
-                "document": self.documents_mapping[idx],
-                "distance": float(dist)
+                "distance": float(dist),
+                "relative_path": target_document.get("path"),
+                "absolute_path": os.path.join(self.base_directory, target_document["path"])
             })
             
         # Return the results
         return results
-    
-    
-    def update(self, documents_path: str, destination_path: Optional[str] = None) -> None:
-        """
-        Update the semantic database with new documents.
-        
-        Parameters:
-        -----------
-        - documents_path (str): the path of the documents to update
-        - destination_path (Optional[str]): the path where to save the updated database
-        
-        Raises:
-        -------
-        - Exception: if the database is not initialized
-        - Exception: if the database is not consistent
-        - Exception: if the number of embedded documents is not equal to the number of documents
-        """
-              
-        # Log status
-        logging.info("Updating the semantic database with new documents...")
-        
-        # Check if the database is initialized
-        if not self._is_database_initialized():
-            # Raise an exception if the database is not initialized
-            raise Exception("The database is not initialized! Please load or create a database first.")
-        
-        # Check if the database is consistent
-        if not self._is_database_consistent():
-            # Raise an exception if the database is not consistent
-            raise Exception("The database is not consistent! The mapping between documents and embeddings is not correct.")
-        
-        # Log status
-        logging.info("Listing the documents in the specified path...")
-        
-        # List the documents in the specified path
-        documents = utils.list_files(documents_path)
-        
-        # Log status
-        logging.info("Embedding the new documents...")
-        
-        # Embed the documents
-        embedded_documents = self._embed_documents(documents)
-        
-        # Append the new documents to the documents mapping
-        self.documents_mapping.extend(embedded_documents)
-        
-        # Check if the number of embedded documents is equal to the number of documents
-        if not self._is_database_consistent():
-            # Raise an exception if the number of embedded documents is not equal to the number of documents
-            raise Exception("Inconsistent database update! The number of embedded documents is not equal to the number of documents!")
-        
-        # Check if the destination path is specified
-        if destination_path is not None:
-            # Log status
-            logging.info("Saving the updated semantic database to the specified path...")
-            
-            # Overwrite the database to the specified path
-            faiss.write_index(self.vector_database, os.path.join(destination_path, self.database_file))
-        
-            # Overwrite the documents mapping
-            with open(os.path.join(destination_path, self.documents_file), "w") as f:
-                json.dump(self.documents_mapping, f, indent=4)
-                
-        # Log status
-        logging.info("Semantic database updated successfully!")
     
     
     def load(self, database_path: str) -> None:
@@ -169,7 +132,6 @@ class SemanticDatabase:
         - Exception: if the configuration file is invalid
         - Exception: if the vector database file is invalid
         - Exception: if the documents mapping file is invalid
-        - Exception: if the database is not consistent
         """
         
         # Log status
@@ -180,21 +142,14 @@ class SemanticDatabase:
             # Raise an exception if the database path does not exist
             raise Exception("The specified database path does not exist!")
         
-        try:
-            # Load the configuration file
-            with open(os.path.join(database_path, self.config_file), "r") as f:
-                config = json.load(f)
-                
+        # Loading the models if not already loaded
+        if not self._is_db_initialized():
             # Load the query and documents encoders
-            self._load_models(config["query_encoder_id"], config["documents_encoder_id"])
-            
-        except Exception as e:
-            # Raise an exception if the configuration file is invalid
-            raise Exception(f"Invalid database configuration file: {e}")
+            self._load_models()
         
         try:
             # Load the vector database
-            self.vector_database = faiss.read_index(os.path.join(database_path, self.database_file))
+            self.vector_database = faiss.read_index(os.path.join(database_path, self.DATABASE_FILE))
             
         except Exception as e:
             # Raise an exception if the vector database file is invalid
@@ -202,95 +157,60 @@ class SemanticDatabase:
         
         try:
             # Load the documents mapping
-            with open(os.path.join(database_path, self.documents_file), "r") as f:
+            with open(os.path.join(database_path, self.DOCUMENTS_FILE), "r") as f:
                 self.documents_mapping = json.load(f)
                 
         except Exception as e:
             # Raise an exception if the documents mapping file is invalid
             raise Exception(f"Invalid documents mapping file: {e}")
         
-        # Check if the database is consistent
-        if not self._is_database_consistent():
-            # Raise an exception if the database is not consistent
-            raise Exception("Error loading the database! The database is not consistent since the mapping between documents and embeddings is not correct.")
-        
         # Log status
         logging.info("Semantic database loaded successfully!")
     
     
-    def create(self, documents_path: str, query_encoder_id: str, documents_encoder_id: str, destination_path: Optional[str] = None) -> None:
+    def create_or_update(self, destination_path: Optional[str] = None) -> None:
         """
         Create a semantic database from the documents in the specified path.
         
         Parameters:
         -----------
-        - documents_path (str): the path of the documents to embed
-        - query_encoder_id (str): the ID of the query encoder model
-        - documents_encoder_id (str): the ID of the documents encoder model
         - destination_path (Optional[str]): the path where to save the database
         
         Raises:
         -------
         - Exception: if the destination path is not a folder
-        - Exception: if the number of embedded documents is not equal to the number of documents
         """
         
-        # Check if the destination path is specified and is a folder
-        if destination_path is not None and os.path.exists(destination_path) and not os.path.isdir(destination_path):
-            # Raise an exception if the destination path is not a folder
-            raise Exception("The destination path should be a folder!")
-        
-        # Log status
-        logging.info("Loading the query and documents encoders...")
-        
-        # Load the query and documents encoders
-        self._load_models(query_encoder_id, documents_encoder_id)
-        
-        # Log status
-        logging.info("Listing the documents in the specified path...")
-        
+        # Check if the database is initialized
+        if not self._is_db_initialized():
+            # Load the query and documents encoders and initialize the vector database and documents mapping
+            logging.info("Creating a new semantic database...")
+            self._load_models()
+            self.documents_mapping = []
+            self.vector_database = faiss.IndexIDMap(faiss.IndexFlatL2(self.documents_encoder.config.hidden_size)) # type: ignore
+               
         # List the documents in the specified path
-        documents = utils.list_files(documents_path)
-        
-        # Log status
-        logging.info("Creating the semantic database...")
-        
-        # Initializing the vector database with the ebedding dimensions 
-        self.vector_database = faiss.IndexFlatL2(self.documents_encoder.config.hidden_size) # type: ignore
-        
-        # Log status
-        logging.info("Embedding the documents...")
+        logging.info("Listing the documents in the specified path...")
+        documents = utils.list_files(self.base_directory)
         
         # Embed the documents
-        embedded_documets = self._embed_documents(documents)
-            
-        # Check if the number of embedded documents is equal to the number of documents
-        if len(embedded_documets) != self.vector_database.ntotal:
-            # Raise an exception if the number of embedded documents is not equal to the number of documents
-            raise Exception("Inconsistent database creation! The number of embedded documents is not equal to the number of documents!")
-                
-        # Save the documents mapping
-        self.documents_mapping = embedded_documets
+        self._embed_documents(documents)
                 
         # Check if the destination path is specified
         if destination_path is not None:
-            # Log status
-            logging.info("Saving the semantic database to the specified path...")
-            
             # Save the database to the specified path
-            self._save_database(
-                destination_path = destination_path, 
-                query_encoder_id = query_encoder_id, 
-                documents_encoder_id = documents_encoder_id
-            )
+            logging.info("Saving the semantic database to the specified path...")
+            self._save_db(destination_path)
             
         # Log status
         logging.info("Semantic database created successfully!")
     
     
+    #########################
     ### Protected methods ###
+    #########################
     
-    def _is_database_initialized(self) -> bool:
+    def _is_db_initialized(self) -> bool:
         """
         Check if the database is initialized
         
@@ -301,45 +221,27 @@ class SemanticDatabase:
         
         # Check if the database is initialized by checking the types of the variables
         return (
-            isinstance(self.vector_database, faiss.IndexFlatL2) and
+            isinstance(self.vector_database, faiss.IndexIDMap) and
             isinstance(self.documents_mapping, list) and
             isinstance(self.documents_encoder, DPRContextEncoder) and
             isinstance(self.documents_tokenizer, DPRContextEncoderTokenizer) and
             isinstance(self.query_encoder, DPRQuestionEncoder) and
             isinstance(self.query_tokenizer, DPRQuestionEncoderTokenizer)
         )
-        
-    
-    def _is_database_consistent(self) -> bool:
-        """
-        Check if the database is consistent
-        
-        Returns:
-        --------
-        - bool: True if the database is consistent, False otherwise
-        """
-        
-        # Check if the number of documents in the mapping is equal to the number of documents in the vector database
-        return len(self.documents_mapping) == self.vector_database.ntotal # type: ignore
     
     
-    def _load_models(self, query_encoder_id: str, documents_encoder_id: str) -> None:
+    def _load_models(self) -> None:
         """
         Load the query and documents encoder models.
-        
-        Parameters:
-        -----------
-        - query_encoder_id (str): the ID of the query encoder model
-        - documents_encoder_id (str): the ID of the documents encoder model
         """
         
         # Initialize the query and documents encoders
-        self.query_encoder = DPRQuestionEncoder.from_pretrained(query_encoder_id)
-        self.documents_encoder = DPRContextEncoder.from_pretrained(documents_encoder_id)
+        self.query_encoder = DPRQuestionEncoder.from_pretrained(self.QUERY_ENCODER_ID)
+        self.documents_encoder = DPRContextEncoder.from_pretrained(self.DOCUMENTS_ECODER_ID)
         
         # Initialize the query and documents tokenizers
-        self.query_tokenizer = DPRQuestionEncoderTokenizer.from_pretrained(query_encoder_id)
-        self.documents_tokenizer = DPRContextEncoderTokenizer.from_pretrained(documents_encoder_id)
+        self.query_tokenizer = DPRQuestionEncoderTokenizer.from_pretrained(self.QUERY_ENCODER_ID)
+        self.documents_tokenizer = DPRContextEncoderTokenizer.from_pretrained(self.DOCUMENTS_ECODER_ID)
         
         # Get the device
         self.device = utils.get_device()
@@ -347,35 +249,34 @@ class SemanticDatabase:
         # Move the models to the device
         self.query_encoder.to(self.device) # type: ignore
         self.documents_encoder.to(self.device) # type: ignore
+
         
-        
-    def _save_database(self, destination_path: str, query_encoder_id: str, documents_encoder_id: str) -> None:
+    def _save_db(self, destination_path: str) -> None:
         """
         Save the database to the specified path.
         
         Parameters:
         -----------
         - destination_path (str): the path where to save the database
-        - query_encoder_id (str): the ID of the query encoder model
-        - documents_encoder_id (str): the ID of the documents encoder model
+        
+        Raises:
+        -------
+        - Exception: if the destination path is not a folder
         """
+        
+        # Check if the destination path exists and is a folder
+        if os.path.exists(destination_path) and not os.path.isdir(destination_path):
+            # Raise an exception if the destination path is not a folder
+            raise Exception("The destination path should be a folder!")
         
         # Create the destination folder if it does not exist
         os.makedirs(destination_path, exist_ok=True)
-        
-        # Save the configuration file
-        with open(os.path.join(destination_path, self.config_file), "w") as f:
-            # Create a configuration file to store the encoder IDs
-            json.dump({
-                "query_encoder_id": query_encoder_id,
-                "documents_encoder_id": documents_encoder_id
-            }, f, indent=4)
             
         # Save the vector database
-        faiss.write_index(self.vector_database, os.path.join(destination_path, self.database_file))
+        faiss.write_index(self.vector_database, os.path.join(destination_path, self.DATABASE_FILE))
         
         # Save the documents
-        with open(os.path.join(destination_path, self.documents_file), "w") as f:
+        with open(os.path.join(destination_path, self.DOCUMENTS_FILE), "w") as f:
             json.dump(self.documents_mapping, f, indent=4)
     
     
@@ -411,7 +312,7 @@ class SemanticDatabase:
         return embeddings
     
     
-    def _embed_documents(self, documents: list[str]) -> list[str]:
+    def _embed_documents(self, documents: list[str]) -> list[dict]:
         """
         Embed the documents and add them to the vector database.
         
@@ -421,14 +322,11 @@ class SemanticDatabase:
         
         Returns:
         --------
-        - list[str]: the list of embedded documents
+        - list[dict]: the list of embedded documents
         """
-    
-        # Initialize the documents mapping
-        embedded_documents = []
         
         # Iterate over the files
-        for document in tqdm(documents):
+        for document in tqdm(documents, desc="Embedding documents"):
             # Check if the file exists
             if not os.path.exists(document):
                 # Log the warning and continue
@@ -438,19 +336,83 @@ class SemanticDatabase:
             try:
                 # Opening the document in read mode
                 with open(document, 'r') as d:
+                    # Reading the content of the document
+                    document_content = d.read()
+                    
+                    # Computing the hash of the document content
+                    document_hash = Cryptography.compute_hash(document_content)
+                    
                     # Reading and encoding the content of the docuemnt into the embedding space
-                    document_embedding = self._encode_texts([d.read()], self.documents_encoder, self.documents_tokenizer) # type: ignore
+                    document_embedding = self._encode_texts([document_content], self.documents_encoder, self.documents_tokenizer) # type: ignore
                     
             except Exception as e:
                 # Log the exception and continue to the next document
                 logging.error(f"Error while processing the document {document}: {e}")
                 continue
-                
-            # Add the document embedding to the vector database
-            self.vector_database.add(document_embedding) # type: ignore
-                
-            # Append the document path to the documents mapping
-            embedded_documents.append(document)
             
-        # Return the documents mapping
-        return embedded_documents
+            # Get the relative path of the document
+            rel_path = os.path.relpath(document, start=self.base_directory)
+            
+            # Look for an existing entry in the mapping based on the document path
+            existing_entry = next((entry for entry in self.documents_mapping if entry.get("path") == rel_path), None)
+            
+            # Check if the document is already in the database
+            if existing_entry is not None:
+                # Check if the document hash is different from the existing one
+                if existing_entry.get("hash") != document_hash:
+                    # Log the information and update the document embedding
+                    logging.info(f"Document {document} has changed. Updating its embedding...")
+                    
+                    # Document changed: update its embedding in the FAISS index.
+                    idx = existing_entry["index"]
+                    
+                    try:
+                        # Update the document embedding in the vector database
+                        self._update_embedding_at_ids([idx], document_embedding[0])
+                        
+                        # Update the document hash in the mapping
+                        existing_entry["hash"] = document_hash
+                        
+                    except Exception as e:
+                        # Log the error and continue to the next document
+                        logging.error(f"Error while updating embedding for {document}: {e}")
+                        continue
+            else:
+                # Add the document embedding to the vector database
+                self.vector_database.add_with_ids(document_embedding, np.array([self.vector_database.ntotal], dtype=np.int64)) # type: ignore
+                
+                # Append the document path to the documents mapping
+                self.documents_mapping.append({
+                    "index": self.vector_database.ntotal - 1, # type: ignore
+                    "hash": document_hash,
+                    "path": rel_path
+                })
+                
+        # Return the embedded documents
+        return self.documents_mapping
+    
+    
+    def _update_embedding_at_ids(self, ids: list[int], documents_embeddings: list[np.ndarray]) -> None:
+        """
+        Update the embeddings of the documents at the specified indices.
+        
+        Parameters:
+        -----------
+        - ids (list[int]): the list of indices to update
+        - documents_embeddings (list[np.ndarray]): the list of new document embeddings
+        """
+        
+        # Convert the list of indices and embeddings to numpy arrays
+        numpy_ids = np.array(ids, dtype=np.int64)
+        numpy_embeddings = np.array(documents_embeddings)
+        
+        # Check if the embeddings are 1D
+        if numpy_embeddings.ndim == 1:
+            # Reshape the embeddings to 2D
+            numpy_embeddings = numpy_embeddings.reshape(1, -1)
+        
+        # Remove the document at the specified index
+        self.vector_database.remove_ids(numpy_ids) # type: ignore
+        
+        # Add the new document embedding at the specified index
+        self.vector_database.add_with_ids(numpy_embeddings, numpy_ids) # type: ignore
