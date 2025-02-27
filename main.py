@@ -5,14 +5,14 @@ from src import SemanticDatabase
 logging.basicConfig(level=logging.INFO)
 
 # Define the base directory and the local destination
-base_directory = "/Users/francescomontanaro/Desktop/5 - Full notes"
-destination_path = "./example_database"
+base_directory = "./documents"
+destination_path = "./database"
 
 # Instantiate the semantic database
 semantic_database = SemanticDatabase(base_directory)
 
 # Creating the database
-#semantic_database.create_or_update(destination_path)
+semantic_database.create_or_update(destination_path)
 
 # Loading the database
 semantic_database.load(destination_path)
