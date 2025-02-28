@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any
 
 from . import utils
 from .cryptography import Cryptography
+from .vector_store import VectorStore
 
 
 class SemanticDatabase:
@@ -47,7 +48,7 @@ class SemanticDatabase:
         self.encoder: Optional[BGEM3FlagModel] = None
         
         # Vector database and documents mapping
-        self.embeddings_db: Optional[np.ndarray] = None
+        self.vector_store: Optional[VectorStore] = None
         self.documents_mapping: List[Dict] = []
         
        
@@ -76,16 +77,15 @@ class SemanticDatabase:
         # Check if the encoder is defined
         assert self._is_db_initialized(), "The database is not initialized! Please load or create a database first!"
         assert isinstance(self.encoder, BGEM3FlagModel), "The encoder should be defined!"
-        assert isinstance(self.embeddings_db, np.ndarray), "The embeddings database should be initialized!"
+        assert isinstance(self.vector_store, VectorStore), "The VectorStore should be initialized!"
         
         # Embedding the query
         query_embedding = self._encode_texts([query_string], self.encoder)
         
         # Search for the most similar documents order by similarity
         # This returns a tuple with the distances and the indices of the documents
-        distances, indices = self._search(
-            query_embedding = query_embedding,
-            db_embeddings = self.embeddings_db,
+        distances, indices = self.vector_store.search(
+            query_embeddings = query_embedding,
             k = num_results
         )
         
@@ -153,7 +153,7 @@ class SemanticDatabase:
         
         try:
             # Load the embeddings database
-            self.embeddings_db = np.load(os.path.join(database_path, self.EMBEDDINGS_FILE))
+            self.vector_store = VectorStore.load(os.path.join(database_path, self.EMBEDDINGS_FILE))
             
         except Exception as e:
             # Raise an exception if the vector database file is invalid
@@ -193,9 +193,9 @@ class SemanticDatabase:
             # Load the model and extract the hidden size
             embed_size = self._load_models()
             
-            # Initialize the vector database and documents mapping
+            # Initialize the vector store and documents mapping
             self.documents_mapping = []
-            self.embeddings_db = np.empty((0, embed_size), dtype=np.float32)
+            self.vector_store = VectorStore(embed_size)
                
         # List the documents in the specified path
         logging.info("Listing the documents in the specified path...")
@@ -225,17 +225,17 @@ class SemanticDatabase:
         
         # Check if the vector database is an instance of faiss.IndexIDMap
         assert self._is_db_initialized(), "The database is not initialized! Please load or create a database first!"
-        assert isinstance(self.embeddings_db, np.ndarray), "The embeddings database should be initialized!"
+        assert isinstance(self.vector_store, VectorStore), "The VectorStore should be initialized!"
         
         # Get the total number of documents to plot (Maximum 100)
-        n_to_plot = min(100, self.embeddings_db.shape[0])
+        n_to_plot = min(100, self.vector_store.count())
         
         # Compute the TSNE embeddings
         perplexity = min(30, n_to_plot - 1) # Set the perplexity to the minimum between 30 and the number of documents to plot
         tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
         
         # Reduce the dimensionality of the embeddings to 2D
-        embeddings_2d = tsne.fit_transform(self.embeddings_db[:n_to_plot])
+        embeddings_2d = tsne.fit_transform(self.vector_store.embeddings[:n_to_plot])
         
         # Plot the 2D embeddings
         plt.figure(figsize=(8, 6))
@@ -268,9 +268,9 @@ class SemanticDatabase:
         
         # Check if the database is initialized by checking the types of the variables
         return (
-            isinstance(self.embeddings_db, np.ndarray) and
+            isinstance(self.vector_store, VectorStore) and
             isinstance(self.documents_mapping, list) and
-            self.encoder is not None
+            isinstance(self.encoder, BGEM3FlagModel)
         )
     
     
@@ -308,14 +308,14 @@ class SemanticDatabase:
         """
         
         # Check if the embeddings database is initialized and the destination path is a folder
-        assert isinstance(self.embeddings_db, np.ndarray), "The embeddings database should be initialized!"
+        assert isinstance(self.vector_store, VectorStore), "The VectorStore should be initialized!"
         assert not (os.path.exists(destination_path) and not os.path.isdir(destination_path)), "The destination path should be a folder!"
         
         # Create the destination folder if it does not exist
         os.makedirs(destination_path, exist_ok=True)
             
         # Save the vector database
-        np.save(os.path.join(destination_path, self.EMBEDDINGS_FILE), self.embeddings_db)
+        self.vector_store.save(os.path.join(destination_path, self.EMBEDDINGS_FILE))
         
         # Save the documents
         with open(os.path.join(destination_path, self.DOCUMENTS_FILE), "w") as f:
@@ -363,7 +363,7 @@ class SemanticDatabase:
         
         # Check if the encoder is defined
         assert isinstance(self.encoder, BGEM3FlagModel), "The encoder should be defined!"
-        assert isinstance(self.embeddings_db, np.ndarray), "The embeddings database should be initialized!"
+        assert isinstance(self.vector_store, VectorStore), "The VectorStore should be initialized!"
         
         # Iterate over the documents
         idx = 0
@@ -445,18 +445,21 @@ class SemanticDatabase:
                 # Check if the document is already in the database
                 if document["entry_to_update_idx"] is not None:
                     # Update the embedding of the document in the vector database
-                    self.embeddings_db[document["entry_to_update_idx"], :] = embedding
+                    self.vector_store.update_at_indices(
+                        indices = np.array([document["entry_to_update_idx"]]),
+                        embeddings = np.array([embedding])
+                    )
                     
                     # Update the document hash in the mapping
                     self.documents_mapping[document["entry_to_update_idx"]]["hash"] = document["hash"]
                     
                 else:
                     # Add the document embedding to the vector database
-                    self.embeddings_db = np.vstack([self.embeddings_db, embedding.reshape(1, -1)])
+                    self.vector_store.add_embeddings(np.array([embedding]))
                     
                     # Append the document path to the documents mapping
                     self.documents_mapping.append({
-                        "index": self.embeddings_db.shape[0] - 1,
+                        "index": self.vector_store.count() - 1,
                         "hash": document["hash"],
                         "path": document["path"]
                     })
@@ -466,36 +469,3 @@ class SemanticDatabase:
                 
         # Return the embedded documents
         return self.documents_mapping
-        
-        
-    @staticmethod
-    def _search(query_embedding: np.ndarray, db_embeddings: np.ndarray, k: int) -> tuple:
-        """
-        Search for the k most similar embeddings in the database to the query embedding.
-        
-        Parameters:
-        -----------
-        - query_embedding (np.ndarray): the query embedding
-        - db_embeddings (np.ndarray): the database embeddings
-        
-        Returns:
-        --------
-        - tuple: a tuple containing the sorted distances and indices of the k most similar embeddings
-        """
-        
-        # Normalize the query and database embeddings by their L2 norm
-        query_norm = query_embedding / (np.linalg.norm(query_embedding, axis=1, keepdims=True) + 1e-10)
-        db_norm = db_embeddings / (np.linalg.norm(db_embeddings, axis=1, keepdims=True) + 1e-10)
-        
-        # Compute the cosine similarities between the query and database embeddings
-        similarities = np.dot(db_norm, query_norm.T).squeeze()
-        
-        # Convert the similarities to distances
-        distances = 1.0 - similarities
-        
-        # Order the distances and get the indices of the k most similar
-        sorted_indices = np.argsort(distances)[:k]
-        sorted_distances = distances[sorted_indices]
-        
-        # Return the sorted distances and indices
-        return sorted_distances.reshape(1, -1), sorted_indices.reshape(1, -1)
