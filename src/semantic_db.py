@@ -7,7 +7,6 @@ from sklearn.manifold import TSNE
 from transformers import AutoConfig
 from FlagEmbedding import BGEM3FlagModel
 from typing import Optional, List, Dict, Any
-from faiss import IndexIDMap, IndexFlatL2, read_index, write_index
 
 from . import utils
 from .cryptography import Cryptography
@@ -19,7 +18,7 @@ class SemanticDatabase:
     ### Static attributes ###
     #########################
     
-    DATABASE_FILE = "database.index" # Name of the vector database file
+    EMBEDDINGS_FILE = "database.npy" # Name of the embeddings file
     DOCUMENTS_FILE = "documents.json" # Name of the documents mapping file
     MODEL_ID = "BAAI/bge-m3" # ID of the encoder model
     
@@ -28,7 +27,7 @@ class SemanticDatabase:
     ##### Magic methods #####
     #########################
     
-    def __init__(self, base_directory: Optional[str] = None, batch_size: int = 1, context_length: int = 8192):
+    def __init__(self, base_directory: Optional[str] = None, batch_size: int = 1, context_length: int = 8192) -> None:
         """
         Initialize the SemanticDatabase class.
         
@@ -44,11 +43,11 @@ class SemanticDatabase:
         self.batch_size = batch_size
         self.context_length = context_length
         
-        # Encoding models and tokenizers
-        self.encoder: Optional[Any] = None
+        # Encoding model
+        self.encoder: Optional[BGEM3FlagModel] = None
         
         # Vector database and documents mapping
-        self.vector_database: Optional[IndexIDMap] = None
+        self.embeddings_db: Optional[np.ndarray] = None
         self.documents_mapping: List[Dict] = []
         
        
@@ -71,23 +70,24 @@ class SemanticDatabase:
         
         Raises:
         -------
-        - Exception: if the database is not initialized
+        - AssertionError: if the database is not initialized or the encoder is not defined
         """
         
-        # Check if the database is initialized
-        if not self._is_db_initialized():
-            # Raise an exception if the database is not initialized
-            raise Exception("The database is not initialized! Please load or create a database first.")
-        
         # Check if the encoder is defined
-        assert self.encoder is not None
+        assert self._is_db_initialized(), "The database is not initialized! Please load or create a database first!"
+        assert isinstance(self.encoder, BGEM3FlagModel), "The encoder should be defined!"
+        assert isinstance(self.embeddings_db, np.ndarray), "The embeddings database should be initialized!"
         
         # Embedding the query
         query_embedding = self._encode_texts([query_string], self.encoder)
         
         # Search for the most similar documents order by similarity
         # This returns a tuple with the distances and the indices of the documents
-        distances, indices = self.vector_database.search(query_embedding, k=num_results) # type: ignore
+        distances, indices = self._search(
+            query_embedding = query_embedding,
+            db_embeddings = self.embeddings_db,
+            k = num_results
+        )
         
         # Initialize the results list
         results = []
@@ -152,8 +152,8 @@ class SemanticDatabase:
             self._load_models()
         
         try:
-            # Load the vector database
-            self.vector_database = read_index(os.path.join(database_path, self.DATABASE_FILE))
+            # Load the embeddings database
+            self.embeddings_db = np.load(os.path.join(database_path, self.EMBEDDINGS_FILE))
             
         except Exception as e:
             # Raise an exception if the vector database file is invalid
@@ -195,7 +195,7 @@ class SemanticDatabase:
             
             # Initialize the vector database and documents mapping
             self.documents_mapping = []
-            self.vector_database = IndexIDMap(IndexFlatL2(embed_size))
+            self.embeddings_db = np.empty((0, embed_size), dtype=np.float32)
                
         # List the documents in the specified path
         logging.info("Listing the documents in the specified path...")
@@ -220,30 +220,22 @@ class SemanticDatabase:
         
         Raises:
         -------
-        - Exception: if the database is not initialized
-        - AssertionError: if the vector database is not an instance of faiss.IndexIDMap
+        - AssertionError: if the database is not initialized or the encoder is not defined
         """
         
-        # Check if the database is initialized
-        if not self._is_db_initialized():
-            # Raise an exception if the database is not initialized
-            raise Exception("The database is not initialized! Please load or create a database first.")
-        
         # Check if the vector database is an instance of faiss.IndexIDMap
-        assert isinstance(self.vector_database, IndexIDMap)
+        assert self._is_db_initialized(), "The database is not initialized! Please load or create a database first!"
+        assert isinstance(self.embeddings_db, np.ndarray), "The embeddings database should be initialized!"
         
         # Get the total number of documents to plot (Maximum 100)
-        n_to_plot = min(100, self.vector_database.ntotal)
+        n_to_plot = min(100, self.embeddings_db.shape[0])
         
         # Compute the TSNE embeddings
         perplexity = min(30, n_to_plot - 1) # Set the perplexity to the minimum between 30 and the number of documents to plot
         tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
         
-        # Get the embeddings of the documents
-        embeddings = np.array([self.vector_database.index.reconstruct(i) for i in range(n_to_plot)])
-        
         # Reduce the dimensionality of the embeddings to 2D
-        embeddings_2d = tsne.fit_transform(embeddings)
+        embeddings_2d = tsne.fit_transform(self.embeddings_db[:n_to_plot])
         
         # Plot the 2D embeddings
         plt.figure(figsize=(8, 6))
@@ -276,7 +268,7 @@ class SemanticDatabase:
         
         # Check if the database is initialized by checking the types of the variables
         return (
-            isinstance(self.vector_database, IndexIDMap) and
+            isinstance(self.embeddings_db, np.ndarray) and
             isinstance(self.documents_mapping, list) and
             self.encoder is not None
         )
@@ -311,19 +303,19 @@ class SemanticDatabase:
         
         Raises:
         -------
-        - Exception: if the destination path is not a folder
+        - AssertionError: if the embeddings database is not initialized
+        - AssertionError: if the destination path is not a folder
         """
         
-        # Check if the destination path exists and is a folder
-        if os.path.exists(destination_path) and not os.path.isdir(destination_path):
-            # Raise an exception if the destination path is not a folder
-            raise Exception("The destination path should be a folder!")
+        # Check if the embeddings database is initialized and the destination path is a folder
+        assert isinstance(self.embeddings_db, np.ndarray), "The embeddings database should be initialized!"
+        assert not (os.path.exists(destination_path) and not os.path.isdir(destination_path)), "The destination path should be a folder!"
         
         # Create the destination folder if it does not exist
         os.makedirs(destination_path, exist_ok=True)
             
         # Save the vector database
-        write_index(self.vector_database, os.path.join(destination_path, self.DATABASE_FILE))
+        np.save(os.path.join(destination_path, self.EMBEDDINGS_FILE), self.embeddings_db)
         
         # Save the documents
         with open(os.path.join(destination_path, self.DOCUMENTS_FILE), "w") as f:
@@ -366,11 +358,12 @@ class SemanticDatabase:
         
         Raises:
         -------
-        - AssertionError: if the encoder is not defined
+        - AssertionError: if the encoder is not defined or the embeddings database is not initialized
         """
         
         # Check if the encoder is defined
-        assert self.encoder is not None
+        assert isinstance(self.encoder, BGEM3FlagModel), "The encoder should be defined!"
+        assert isinstance(self.embeddings_db, np.ndarray), "The embeddings database should be initialized!"
         
         # Iterate over the documents
         idx = 0
@@ -451,19 +444,19 @@ class SemanticDatabase:
             for document, embedding in zip(batch, batch_embeddings):
                 # Check if the document is already in the database
                 if document["entry_to_update_idx"] is not None:
-                    # Update the document embedding in the FAISS index
-                    self._update_embedding_at_ids([document["entry_to_update_idx"]], embedding)
+                    # Update the embedding of the document in the vector database
+                    self.embeddings_db[document["entry_to_update_idx"], :] = embedding
                     
                     # Update the document hash in the mapping
                     self.documents_mapping[document["entry_to_update_idx"]]["hash"] = document["hash"]
                     
                 else:
                     # Add the document embedding to the vector database
-                    self.vector_database.add_with_ids(embedding.reshape(1, -1), np.array([self.vector_database.ntotal], dtype=np.int64)) # type: ignore
+                    self.embeddings_db = np.vstack([self.embeddings_db, embedding.reshape(1, -1)])
                     
                     # Append the document path to the documents mapping
                     self.documents_mapping.append({
-                        "index": self.vector_database.ntotal - 1, # type: ignore
+                        "index": self.embeddings_db.shape[0] - 1,
                         "hash": document["hash"],
                         "path": document["path"]
                     })
@@ -473,29 +466,36 @@ class SemanticDatabase:
                 
         # Return the embedded documents
         return self.documents_mapping
-    
-    
-    def _update_embedding_at_ids(self, ids: list[int], documents_embeddings: list[np.ndarray]) -> None:
+        
+        
+    @staticmethod
+    def _search(query_embedding: np.ndarray, db_embeddings: np.ndarray, k: int) -> tuple:
         """
-        Update the embeddings of the documents at the specified indices.
+        Search for the k most similar embeddings in the database to the query embedding.
         
         Parameters:
         -----------
-        - ids (list[int]): the list of indices to update
-        - documents_embeddings (list[np.ndarray]): the list of new document embeddings
+        - query_embedding (np.ndarray): the query embedding
+        - db_embeddings (np.ndarray): the database embeddings
+        
+        Returns:
+        --------
+        - tuple: a tuple containing the sorted distances and indices of the k most similar embeddings
         """
         
-        # Convert the list of indices and embeddings to numpy arrays
-        numpy_ids = np.array(ids, dtype=np.int64)
-        numpy_embeddings = np.array(documents_embeddings)
+        # Normalize the query and database embeddings by their L2 norm
+        query_norm = query_embedding / (np.linalg.norm(query_embedding, axis=1, keepdims=True) + 1e-10)
+        db_norm = db_embeddings / (np.linalg.norm(db_embeddings, axis=1, keepdims=True) + 1e-10)
         
-        # Check if the embeddings are 1D
-        if numpy_embeddings.ndim == 1:
-            # Reshape the embeddings to 2D
-            numpy_embeddings = numpy_embeddings.reshape(1, -1)
+        # Compute the cosine similarities between the query and database embeddings
+        similarities = np.dot(db_norm, query_norm.T).squeeze()
         
-        # Remove the document at the specified index
-        self.vector_database.remove_ids(numpy_ids) # type: ignore
+        # Convert the similarities to distances
+        distances = 1.0 - similarities
         
-        # Add the new document embedding at the specified index
-        self.vector_database.add_with_ids(numpy_embeddings, numpy_ids) # type: ignore
+        # Order the distances and get the indices of the k most similar
+        sorted_indices = np.argsort(distances)[:k]
+        sorted_distances = distances[sorted_indices]
+        
+        # Return the sorted distances and indices
+        return sorted_distances.reshape(1, -1), sorted_indices.reshape(1, -1)

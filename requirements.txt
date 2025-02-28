@@ -1,7 +1,6 @@
-faiss_cpu
-matplotlib
 numpy
-scikit_learn
 torch
-tqdm
+FlagEmbedding
+matplotlib
+scikit_learn
 transformers
