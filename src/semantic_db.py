@@ -1,13 +1,13 @@
 import os
 import json
-import faiss
 import logging
 import numpy as np
-from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
-from typing import Optional, List, Dict
-from transformers import DPRQuestionEncoder, DPRContextEncoder, DPRQuestionEncoderTokenizer, DPRContextEncoderTokenizer
+from transformers import AutoConfig
+from FlagEmbedding import BGEM3FlagModel
+from typing import Optional, List, Dict, Any
+from faiss import IndexIDMap, IndexFlatL2, read_index, write_index
 
 from . import utils
 from .cryptography import Cryptography
@@ -21,35 +21,34 @@ class SemanticDatabase:
     
     DATABASE_FILE = "database.index" # Name of the vector database file
     DOCUMENTS_FILE = "documents.json" # Name of the documents mapping file
-    
-    QUERY_ENCODER_ID = "facebook/dpr-question_encoder-single-nq-base" # ID of the query encoder model
-    DOCUMENTS_ECODER_ID = "facebook/dpr-ctx_encoder-single-nq-base" # ID of the documents encoder model
+    MODEL_ID = "BAAI/bge-m3" # ID of the encoder model
     
     
     #########################
     ##### Magic methods #####
     #########################
     
-    def __init__(self, base_directory: Optional[str] = None):
+    def __init__(self, base_directory: Optional[str] = None, batch_size: int = 1, context_length: int = 8192):
         """
         Initialize the SemanticDatabase class.
         
         Parameters:
         -----------
         - base_directory (Optional[str]): the base directory to use. Default is the current working directory.
+        - batch_size (int): the batch size to use for embedding the documents
+        - context_length (int): the maximum length of the context
         """
         
-        # Set the base directory
+        # Save the parameters
         self.base_directory = base_directory or os.getcwd()
+        self.batch_size = batch_size
+        self.context_length = context_length
         
         # Encoding models and tokenizers
-        self.query_encoder: Optional[DPRQuestionEncoder] = None
-        self.query_tokenizer: Optional[DPRQuestionEncoderTokenizer] = None
-        self.documents_encoder: Optional[DPRContextEncoder] = None
-        self.documents_tokenizer: Optional[DPRContextEncoderTokenizer] = None
+        self.encoder: Optional[Any] = None
         
         # Vector database and documents mapping
-        self.vector_database: Optional[faiss.IndexIDMap] = None
+        self.vector_database: Optional[IndexIDMap] = None
         self.documents_mapping: List[Dict] = []
         
        
@@ -80,8 +79,11 @@ class SemanticDatabase:
             # Raise an exception if the database is not initialized
             raise Exception("The database is not initialized! Please load or create a database first.")
         
+        # Check if the encoder is defined
+        assert self.encoder is not None
+        
         # Embedding the query
-        query_embedding = self._encode_texts([query_string], self.query_encoder, self.query_tokenizer) # type: ignore
+        query_embedding = self._encode_texts([query_string], self.encoder)
         
         # Search for the most similar documents order by similarity
         # This returns a tuple with the distances and the indices of the documents
@@ -151,7 +153,7 @@ class SemanticDatabase:
         
         try:
             # Load the vector database
-            self.vector_database = faiss.read_index(os.path.join(database_path, self.DATABASE_FILE))
+            self.vector_database = read_index(os.path.join(database_path, self.DATABASE_FILE))
             
         except Exception as e:
             # Raise an exception if the vector database file is invalid
@@ -185,11 +187,15 @@ class SemanticDatabase:
         
         # Check if the database is initialized
         if not self._is_db_initialized():
-            # Load the query and documents encoders and initialize the vector database and documents mapping
+            # Log status
             logging.info("Creating a new semantic database...")
-            self._load_models()
+            
+            # Load the model and extract the hidden size
+            embed_size = self._load_models()
+            
+            # Initialize the vector database and documents mapping
             self.documents_mapping = []
-            self.vector_database = faiss.IndexIDMap(faiss.IndexFlatL2(self.documents_encoder.config.hidden_size)) # type: ignore
+            self.vector_database = IndexIDMap(IndexFlatL2(embed_size))
                
         # List the documents in the specified path
         logging.info("Listing the documents in the specified path...")
@@ -215,6 +221,7 @@ class SemanticDatabase:
         Raises:
         -------
         - Exception: if the database is not initialized
+        - AssertionError: if the vector database is not an instance of faiss.IndexIDMap
         """
         
         # Check if the database is initialized
@@ -222,18 +229,21 @@ class SemanticDatabase:
             # Raise an exception if the database is not initialized
             raise Exception("The database is not initialized! Please load or create a database first.")
         
+        # Check if the vector database is an instance of faiss.IndexIDMap
+        assert isinstance(self.vector_database, IndexIDMap)
+        
         # Get the total number of documents to plot (Maximum 100)
-        n_to_plot = min(100, self.vector_database.ntotal) # type: ignore
+        n_to_plot = min(100, self.vector_database.ntotal)
         
         # Compute the TSNE embeddings
         perplexity = min(30, n_to_plot - 1) # Set the perplexity to the minimum between 30 and the number of documents to plot
         tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
         
         # Get the embeddings of the documents
-        embeddings = np.array([self.vector_database.index.reconstruct(i) for i in range(n_to_plot)]) # type: ignore
+        embeddings = np.array([self.vector_database.index.reconstruct(i) for i in range(n_to_plot)])
         
         # Reduce the dimensionality of the embeddings to 2D
-        embeddings_2d = tsne.fit_transform(embeddings) # type: ignore
+        embeddings_2d = tsne.fit_transform(embeddings)
         
         # Plot the 2D embeddings
         plt.figure(figsize=(8, 6))
@@ -266,34 +276,29 @@ class SemanticDatabase:
         
         # Check if the database is initialized by checking the types of the variables
         return (
-            isinstance(self.vector_database, faiss.IndexIDMap) and
+            isinstance(self.vector_database, IndexIDMap) and
             isinstance(self.documents_mapping, list) and
-            isinstance(self.documents_encoder, DPRContextEncoder) and
-            isinstance(self.documents_tokenizer, DPRContextEncoderTokenizer) and
-            isinstance(self.query_encoder, DPRQuestionEncoder) and
-            isinstance(self.query_tokenizer, DPRQuestionEncoderTokenizer)
+            self.encoder is not None
         )
     
     
-    def _load_models(self) -> None:
+    def _load_models(self) -> int:
         """
         Load the query and documents encoder models.
+        
+        Returns:
+        --------
+        - int: the hidden size of the encoder model
         """
-        
+
         # Initialize the query and documents encoders
-        self.query_encoder = DPRQuestionEncoder.from_pretrained(self.QUERY_ENCODER_ID)
-        self.documents_encoder = DPRContextEncoder.from_pretrained(self.DOCUMENTS_ECODER_ID)
+        self.encoder = BGEM3FlagModel(self.MODEL_ID, use_fp16=True)
         
-        # Initialize the query and documents tokenizers
-        self.query_tokenizer = DPRQuestionEncoderTokenizer.from_pretrained(self.QUERY_ENCODER_ID)
-        self.documents_tokenizer = DPRContextEncoderTokenizer.from_pretrained(self.DOCUMENTS_ECODER_ID)
+        # Get the hidden size of the encoder model
+        config = AutoConfig.from_pretrained(self.MODEL_ID)
         
-        # Get the device
-        self.device = utils.get_device()
-        
-        # Move the models to the device
-        self.query_encoder.to(self.device) # type: ignore
-        self.documents_encoder.to(self.device) # type: ignore
+        # Return the hidden size of the encoder model
+        return getattr(config, "hidden_size")
 
         
     def _save_db(self, destination_path: str) -> None:
@@ -318,14 +323,14 @@ class SemanticDatabase:
         os.makedirs(destination_path, exist_ok=True)
             
         # Save the vector database
-        faiss.write_index(self.vector_database, os.path.join(destination_path, self.DATABASE_FILE))
+        write_index(self.vector_database, os.path.join(destination_path, self.DATABASE_FILE))
         
         # Save the documents
         with open(os.path.join(destination_path, self.DOCUMENTS_FILE), "w") as f:
             json.dump(self.documents_mapping, f, indent=4)
     
     
-    def _encode_texts(self, texts: list[str], encoder: DPRQuestionEncoder, tokenizer: DPRQuestionEncoderTokenizer, max_context_length: int = 512) -> np.ndarray:
+    def _encode_texts(self, texts: list[str], encoder: Any) -> np.ndarray:
         """
         Encode a list of texts using the specified encoder and tokenizer.
         
@@ -334,24 +339,14 @@ class SemanticDatabase:
         - texts (list[str]): the list of texts to encode
         - encoder (DPRQuestionEncoder): the encoder model to use
         - tokenizer (DPRQuestionEncoderTokenizer): the tokenizer to use
-        - max_context_length (int): the maximum length of the context
         
         Returns:
         --------
         - np.ndarray: the embeddings of the texts
         """
         
-        # Tokenize the text and convert to PyTorch tensors
-        inputs = tokenizer(
-            texts, 
-            return_tensors = "pt", 
-            padding = True, 
-            truncation = True,
-            max_length = max_context_length 
-        ).to(self.device)
-        
         # Get the embeddings using the encoder model and convert them to a numpy array
-        embeddings = encoder(**inputs).pooler_output.detach().cpu().numpy()
+        embeddings = encoder.encode(texts, batch_size=self.batch_size, max_length=self.context_length)['dense_vecs']
         
         # Return the embeddings
         return embeddings
@@ -368,70 +363,113 @@ class SemanticDatabase:
         Returns:
         --------
         - list[dict]: the list of embedded documents
+        
+        Raises:
+        -------
+        - AssertionError: if the encoder is not defined
         """
         
-        # Iterate over the files
-        for document in tqdm(documents, desc="Embedding documents"):
-            # Check if the file exists
-            if not os.path.exists(document):
-                # Log the warning and continue
-                logging.warning(f"The document {document} does not exist! Skipping...")
-                continue
+        # Check if the encoder is defined
+        assert self.encoder is not None
+        
+        # Iterate over the documents
+        idx = 0
+        while idx < len(documents):
             
-            try:
-                # Opening the document in read mode
-                with open(document, 'r') as d:
-                    # Reading the content of the document
-                    document_content = d.read()
-                    
-                    # Computing the hash of the document content
+            # Iterate untile the batch size to take precise batches of documents
+            batch = []
+            while len(batch) < self.batch_size and idx < len(documents):
+                # Extract the document
+                document = documents[idx]
+            
+                # Check if the file exists
+                if not os.path.exists(document):
+                    # Log the warning and continue
+                    logging.warning(f"The document {document} does not exist! Skipping...")
+                    idx += 1
+                    continue
+                
+                try:
+                    # Opening the document in read mode
+                    with open(document, 'r') as d:
+                        # Reading the content of the document
+                        document_content = d.read()
+                        
+                    # Extract the relative path of the document and compute its hash
+                    document_rel_path = os.path.relpath(document, start=self.base_directory)
                     document_hash = Cryptography.compute_hash(document_content)
                     
-                    # Reading and encoding the content of the docuemnt into the embedding space
-                    document_embedding = self._encode_texts([document_content], self.documents_encoder, self.documents_tokenizer) # type: ignore
+                    # Look for an existing entry in the mapping based on the document path
+                    existing_entry = next((entry for entry in self.documents_mapping if entry.get("path") == document_rel_path), None)
                     
-            except Exception as e:
-                # Log the exception and continue to the next document
-                logging.error(f"Error while processing the document {document}: {e}")
-                continue
-            
-            # Get the relative path of the document
-            rel_path = os.path.relpath(document, start=self.base_directory)
-            
-            # Look for an existing entry in the mapping based on the document path
-            existing_entry = next((entry for entry in self.documents_mapping if entry.get("path") == rel_path), None)
-            
-            # Check if the document is already in the database
-            if existing_entry is not None:
-                # Check if the document hash is different from the existing one
-                if existing_entry.get("hash") != document_hash:
-                    # Log the information and update the document embedding
-                    logging.info(f"Document {document} has changed. Updating its embedding...")
+                    # Check if the document is already in the database
+                    entry_to_update_idx = None
+                    if existing_entry is not None:
+                        # Check if the document hash is different from the existing one
+                        if existing_entry.get("hash") != document_hash:
+                            # Log the information and update the document embedding
+                            logging.info(f"Document {document} has changed. Updating its embedding...")
                     
-                    # Document changed: update its embedding in the FAISS index.
-                    idx = existing_entry["index"]
-                    
-                    try:
-                        # Update the document embedding in the vector database
-                        self._update_embedding_at_ids([idx], document_embedding[0])
+                            # Document changed: Save the index of the document to update in the FAISS index
+                            entry_to_update_idx = existing_entry["index"]
                         
-                        # Update the document hash in the mapping
-                        existing_entry["hash"] = document_hash
+                        else:
+                            # Log the information and continue to the next document
+                            logging.info(f"Document {document} is already in the database. Skipping...")
+                            idx += 1
+                            continue
+                    
+                    # Append the document content to the list
+                    batch.append({
+                        "hash": document_hash,
+                        "path": document_rel_path,
+                        "content": document_content,
+                        "entry_to_update_idx": entry_to_update_idx
+                    })
                         
-                    except Exception as e:
-                        # Log the error and continue to the next document
-                        logging.error(f"Error while updating embedding for {document}: {e}")
-                        continue
-            else:
-                # Add the document embedding to the vector database
-                self.vector_database.add_with_ids(document_embedding, np.array([self.vector_database.ntotal], dtype=np.int64)) # type: ignore
+                except Exception as e:
+                    # Log the exception and continue to the next document
+                    logging.error(f"Error while processing the document {document}: {e}")
+                    continue
                 
-                # Append the document path to the documents mapping
-                self.documents_mapping.append({
-                    "index": self.vector_database.ntotal - 1, # type: ignore
-                    "hash": document_hash,
-                    "path": rel_path
-                })
+                finally:
+                    # Increment the index
+                    idx += 1
+            
+            # Check if the batch is empty
+            if len(batch) == 0:
+                # Break the loop if the batch is empty
+                break
+            
+            # Embed the batch of documents
+            batch_embeddings = self._encode_texts(
+                texts = [doc["content"] for doc in batch],
+                encoder = self.encoder
+            )
+            
+            # Iterate over the documents and corresponding embeddings
+            for document, embedding in zip(batch, batch_embeddings):
+                # Check if the document is already in the database
+                if document["entry_to_update_idx"] is not None:
+                    # Update the document embedding in the FAISS index
+                    self._update_embedding_at_ids([document["entry_to_update_idx"]], embedding)
+                    
+                    # Update the document hash in the mapping
+                    self.documents_mapping[document["entry_to_update_idx"]]["hash"] = document["hash"]
+                    
+                else:
+                    # Add the document embedding to the vector database
+                    self.vector_database.add_with_ids(embedding.reshape(1, -1), np.array([self.vector_database.ntotal], dtype=np.int64)) # type: ignore
+                    
+                    # Append the document path to the documents mapping
+                    self.documents_mapping.append({
+                        "index": self.vector_database.ntotal - 1, # type: ignore
+                        "hash": document["hash"],
+                        "path": document["path"]
+                    })
+                    
+                # Log the information
+                logging.info(f"Embedded document --> {document['path']}")
                 
         # Return the embedded documents
         return self.documents_mapping
