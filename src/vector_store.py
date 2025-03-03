@@ -1,5 +1,6 @@
 import os
 import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 class VectorStore:
@@ -151,12 +152,8 @@ class VectorStore:
         - tuple: a tuple containing the sorted distances and indices of the k most similar embeddings
         """
         
-        # Normalize the query and database embeddings by their L2 norm
-        query_norm = query_embeddings / (np.linalg.norm(query_embeddings, axis=1, keepdims=True) + 1e-10)
-        db_norm = self.embeddings / (np.linalg.norm(self.embeddings, axis=1, keepdims=True) + 1e-10)
-        
         # Compute the cosine similarities between the query and database embeddings
-        similarities = np.dot(db_norm, query_norm.T).squeeze()
+        similarities = cosine_similarity(query_embeddings, self.embeddings).squeeze()
         
         # Convert the similarities to distances
         distances = 1.0 - similarities

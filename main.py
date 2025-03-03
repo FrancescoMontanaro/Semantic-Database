@@ -26,7 +26,7 @@ semantic_database.plot_space()
 
 # Executing a query
 results = semantic_database.query(
-    query_string = "Voglio acquistare un asset",
+    query_string = "What is an upper confidence bound?",
     num_results = 5
 )
 
